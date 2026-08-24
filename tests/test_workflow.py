@@ -128,8 +128,13 @@ async def review_round(repo: str, number: int, round_number: int) -> ReviewRound
     """
     JOURNAL.append(f"review:{number}:{round_number}")
     plan = STATE.get("review_plan", {}).get(number, [])
-    step = plan[min(round_number - 1, len(plan) - 1)] if plan else {"settled": True,
-                                                                    "verdict": "clean"}
+    # Сценарий разворачивается по числу ВЫЗОВОВ, а не по номеру круга: ожидание
+    # ревью круга не тратит, и настоящая активность решает по живому состоянию.
+    seen = STATE.setdefault("review_calls", {})
+    index = seen.get(number, 0)
+    seen[number] = index + 1
+    step = plan[min(index, len(plan) - 1)] if plan else {"settled": True,
+                                                         "verdict": "clean"}
     verdict = step.get("verdict")
     if verdict:
         # Круг меняет состояние PR — прежняя очередь ответов на него больше
@@ -334,3 +339,20 @@ async def test_conflict_fix_forces_a_fresh_review():
     assert "fix:4" in JOURNAL
     assert JOURNAL.index("fix:4") < JOURNAL.index("review:4:1")
     assert result["shipped"] == [4]
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_review_does_not_burn_fix_rounds():
+    """Пока PR-Agent считает, никто ничего не исправлял.
+
+    Живой прогон на #113: ревью уже было сделано, но контур его не распознал и
+    сжёг три круга на ожидании — PR ушёл человеку без единого замечания.
+    """
+    result = await _run(
+        [_pr(5, review_verdict="none")],
+        review_plan={5: [{"settled": False, "changed": False},
+                         {"settled": False, "changed": False},
+                         {"settled": True, "verdict": "clean"}]})
+
+    assert result["shipped"] == [5]
+    assert "review-exhausted:5" not in JOURNAL

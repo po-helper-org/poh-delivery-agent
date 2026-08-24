@@ -87,3 +87,23 @@ def test_review_head_takes_the_last_mention():
         note("Persistent review updated to latest commit 2222222"),
     ])
     assert head == "2222222"
+
+
+def test_review_head_reads_a_commit_link():
+    """PR-Agent пишет ссылку, а не голый sha — живой формат на poh-demo-checkout.
+
+    Разбор только голого sha считал ревью отсутствующим: релиз крутил круги,
+    прося ревью, которое уже было сделано, и упирался в потолок кругов.
+    """
+    body = ("## PR Reviewer Guide 🔍\n\n#### (Review updated until commit "
+            "https://github.com/po-helper-org/poh-demo-checkout/commit/"
+            "2ecbc5c541e14527dd460747f7d57d416736dd76)")
+    assert review.review_head([note(body)]) == "2ecbc5c541e14527dd460747f7d57d416736dd76"
+
+
+def test_review_of_current_head_by_link_is_not_stale():
+    body = ("#### (Review updated until commit "
+            "https://github.com/o/r/commit/abc1234def5678)")
+    result, _ = review.verdict(HEAD, HEAD_TIME, "COMMENTED", [], [note(body)])
+    assert result == review.STALE     # ревью есть, но вердикта круга ещё нет
+    assert review.review_head([note(body)]).startswith("abc1234")

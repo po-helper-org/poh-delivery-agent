@@ -63,9 +63,16 @@ MERGEABILITY_WAIT_SECONDS = 20
 # протокола для доведения PR: агент, который третий раз не сходится с ревью,
 # дальше не сойдётся, он спорит, а не исправляет. Такой PR уходит человеку.
 REVIEW_ROUNDS = 3
-# Пауза перед перечитыванием состояния после запроса ревью: PR-Agent отвечает
-# минутами, и опрашивать его чаще — только жечь лимиты GitHub.
+# Ожидание ревью — НЕ круг правок. Пока PR-Agent считает, никто ничего не
+# исправлял, и тратить на это потолок кругов значит отдать человеку PR, к
+# которому никто не предъявил ни одного замечания.
+REVIEW_WAIT_TRIES = 6
+# Пауза перед перечитыванием состояния: PR-Agent отвечает минутами, и опрашивать
+# его чаще — только жечь лимиты GitHub.
 REVIEW_POLL_SECONDS = 90
+# После «замечаний нет» итог круга публикуется комментарием — вердикт появится
+# через секунды, а не минуты.
+VERDICT_SETTLE_SECONDS = 20
 
 _READ = RetryPolicy(maximum_attempts=3)
 # Мутации не ретраятся вслепую: повторный мерж по уже влитому PR вернёт 405, а
@@ -392,10 +399,12 @@ class DeliveryRelease:
         внутри круга делает агент разработки Harness — тот же, что чинит
         конфликты; Delivery-Agent только держит цикл и считает круги.
         """
-        for round_number in range(1, REVIEW_ROUNDS + 1):
+        rounds = 0
+        waits = 0
+        while rounds < REVIEW_ROUNDS and waits <= REVIEW_WAIT_TRIES:
             try:
                 result: ReviewRound = await workflow.execute_activity(
-                    "delivery_review_round", args=[repo, number, round_number],
+                    "delivery_review_round", args=[repo, number, rounds + 1],
                     task_queue=HARNESS_TASK_QUEUE, result_type=ReviewRound,
                     start_to_close_timeout=timedelta(minutes=60),
                     heartbeat_timeout=timedelta(minutes=10), retry_policy=_WRITE)
@@ -405,10 +414,17 @@ class DeliveryRelease:
                 return await self._settled_facts(repo, number)
 
             if result.changed:
+                rounds += 1
                 # Правки внесены, ревью запрошено — ждём CI по новому коммиту,
                 # иначе следующий круг будет читать ревью прежнего кода.
                 facts = await self._wait_for_checks(repo, number)
+            elif result.settled:
+                rounds += 1
+                await workflow.sleep(timedelta(seconds=VERDICT_SETTLE_SECONDS))
+                facts = await self._settled_facts(repo, number)
             else:
+                # Ревью ещё нет — это ожидание, а не круг правок.
+                waits += 1
                 await workflow.sleep(timedelta(seconds=REVIEW_POLL_SECONDS))
                 facts = await self._settled_facts(repo, number)
 
