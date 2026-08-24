@@ -120,6 +120,14 @@ class DeliveryRelease:
             tag=rules.next_tag(tags, day), checks_source=bundle.source,
             skipped=skipped, delegated=delegated)
 
+        if not plan.steps:
+            # Пустая очередь — законный исход, а не сбой: одобренных PR может не
+            # быть вовсе. Релиз при этом НЕ создаётся: черновик «ничего не
+            # отгружено» — мусор, который копится в репозитории с каждой
+            # проверочной командой, а разбор причин уезжает комментарием.
+            await self._finish_empty(repo, request, plan)
+            return self._summary(plan, [], ReleaseRef(), published=False)
+
         body = render.plan_md(plan, request.requested_by, info.run_id, info.workflow_id)
         release: ReleaseRef = await workflow.execute_activity(
             "delivery_create_release",
@@ -130,13 +138,6 @@ class DeliveryRelease:
         for step in plan.steps:
             await self._comment(repo, step.pr_number,
                                 render.pr_announcement(plan, release.url, step.order))
-
-        if not plan.steps:
-            # Пустая очередь — законный исход, а не сбой: одобренных PR может не
-            # быть вовсе. Релиз при этом остаётся черновиком, чтобы не плодить
-            # публикации «ничего не отгружено».
-            await self._finish_empty(repo, request, plan, release, info)
-            return self._summary(plan, [], release, published=False)
 
         # --- Шаг 5: отгрузка по одному шагу с проверкой живой системы ---
         outcomes: list[StepOutcome] = []
@@ -304,12 +305,10 @@ class DeliveryRelease:
             return False
         return bool(result.ok)
 
-    async def _finish_empty(self, repo: str, request: DeliveryRequest, plan,
-                            release: ReleaseRef, info) -> None:
+    async def _finish_empty(self, repo: str, request: DeliveryRequest, plan) -> None:
         note = ("**Delivery-Agent: отгружать нечего.**\n\n"
-                "Ни один открытый PR не прошёл отбор.\n\n"
-                + (render.verdict_lines(plan.skipped + plan.delegated) or "Открытых PR нет.")
-                + f"\n\nЧерновик релиза с разбором: {release.url}")
+                "Ни один открытый PR не прошёл отбор, релиз не заводился.\n\n"
+                + (render.verdict_lines(plan.skipped + plan.delegated) or "Открытых PR нет."))
         if request.issue_number:
             await self._comment(repo, request.issue_number, note)
 

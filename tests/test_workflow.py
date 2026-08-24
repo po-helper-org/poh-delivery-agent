@@ -209,11 +209,17 @@ async def test_conflicted_pr_goes_to_developer_and_returns():
 
 
 @pytest.mark.asyncio
-async def test_nothing_to_ship_keeps_release_draft():
+async def test_nothing_to_ship_creates_no_release_at_all():
+    """Пустая очередь не оставляет следа в списке релизов.
+
+    Черновик «ничего не отгружено» копился бы в репозитории с каждой
+    проверочной командой; причины отказа уезжают комментарием.
+    """
     result = await _run([_pr(4, approved=False)])
     assert result["planned"] == 0
     assert result["published"] is False
     assert result["skipped"] == [4]
+    assert not [entry for entry in JOURNAL if entry.startswith("release:")]
     assert "publish:True" not in JOURNAL
 
 
