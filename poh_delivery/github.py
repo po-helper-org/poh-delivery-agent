@@ -12,6 +12,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from typing import Callable
 
 import requests
@@ -22,6 +23,11 @@ _log = logging.getLogger(__name__)
 
 API = os.environ.get("GITHUB_API", "https://api.github.com")
 _TIMEOUT = 30
+# GitHub считает мержабельность ЛЕНИВО и пересчитывает её после каждого мержа в
+# базу: первый запрос возвращает `mergeable: null` и запускает расчёт, ответ
+# приходит через секунды. Документация прямо предписывает перезапрашивать.
+_MERGEABLE_TRIES = int(os.environ.get("DELIVERY_MERGEABLE_TRIES", "8"))
+_MERGEABLE_PAUSE = float(os.environ.get("DELIVERY_MERGEABLE_PAUSE", "3"))
 
 
 def env_token_provider(repo: str) -> str:
@@ -83,7 +89,7 @@ class GitHubApi:
         return [self.pull_facts(repo, item["number"]) for item in listing]
 
     def pull_facts(self, repo: str, number: int) -> PullFacts:
-        pull = self._get(repo, f"/repos/{repo}/pulls/{number}")
+        pull = self._pull_with_mergeability(repo, number)
         files = [f["filename"] for f in
                  self._get(repo, f"/repos/{repo}/pulls/{number}/files", per_page=100)]
         approved, decision = self._review_decision(repo, number)
@@ -108,6 +114,28 @@ class GitHubApi:
             updated_at=pull.get("updated_at", ""),
             body=pull.get("body") or "",
         )
+
+    def _pull_with_mergeability(self, repo: str, number: int) -> dict:
+        """Карточка PR, дочитанная до определённой мержабельности.
+
+        `mergeable: null` — не «конфликта нет» и не «конфликт есть», а «расчёт
+        запущен, ответа пока нет». Решать по нему нельзя: на живом релизе
+        `release-2026-08-24.2` из-за этого выпали ЧЕТЫРЕ PR сразу — предыдущий
+        мерж в базу обнулил расчёт у всех открытых, и снимок состояния застал
+        их всех в неизвестности.
+
+        Ждём в активности, а не в воркфлоу: это секунды, и дробить их на шаги
+        истории Temporal незачем.
+        """
+        for attempt in range(_MERGEABLE_TRIES):
+            pull = self._get(repo, f"/repos/{repo}/pulls/{number}")
+            if pull.get("mergeable") is not None or pull.get("state") != "open":
+                return pull
+            if attempt + 1 < _MERGEABLE_TRIES:
+                time.sleep(_MERGEABLE_PAUSE)
+        _log.warning("мержабельность %s#%s не досчиталась за %s попыток",
+                     repo, number, _MERGEABLE_TRIES)
+        return pull
 
     def _review_decision(self, repo: str, number: int) -> tuple[bool, str]:
         """Одобрен ли PR — по последнему отзыву каждого ревьюера.

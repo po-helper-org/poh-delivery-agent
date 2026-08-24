@@ -85,3 +85,40 @@ def test_dead_service_is_red_not_exception(monkeypatch):
     result = prod.DockerProd(lambda repo: "t")._one_check("http://svc:8080", _check())
     assert not result.ok
     assert "не прошёл" in result.detail
+
+
+def test_mergeability_is_polled_until_it_settles(monkeypatch):
+    """`mergeable: null` перезапрашивается, а не считается ответом.
+
+    Живой релиз `release-2026-08-24.2`: мерж предыдущего шага обнулил расчёт у
+    всех открытых PR, и снимок застал четыре штуки в неизвестности — все
+    выпали из релиза.
+    """
+    from poh_delivery import github as github_module
+
+    monkeypatch.setattr(github_module, "_MERGEABLE_PAUSE", 0)
+    answers = [{"mergeable": None, "state": "open"},
+               {"mergeable": None, "state": "open"},
+               {"mergeable": True, "state": "open", "number": 5}]
+    calls = {"n": 0}
+
+    def fake_get(self, repo, path, **params):
+        calls["n"] += 1
+        return answers[min(calls["n"] - 1, len(answers) - 1)]
+
+    monkeypatch.setattr(github_module.GitHubApi, "_get", fake_get)
+    api = github_module.GitHubApi(lambda repo: "t")
+    pull = api._pull_with_mergeability("o/r", 5)
+    assert pull["mergeable"] is True
+    assert calls["n"] == 3
+
+
+def test_closed_pr_stops_the_polling(monkeypatch):
+    """Закрытый PR мержабельность не досчитает никогда — ждать его бессмысленно."""
+    from poh_delivery import github as github_module
+
+    monkeypatch.setattr(github_module, "_MERGEABLE_PAUSE", 0)
+    monkeypatch.setattr(github_module.GitHubApi, "_get",
+                        lambda self, repo, path, **params: {"mergeable": None, "state": "closed"})
+    api = github_module.GitHubApi(lambda repo: "t")
+    assert api._pull_with_mergeability("o/r", 5)["state"] == "closed"
