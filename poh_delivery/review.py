@@ -37,9 +37,13 @@ SETTLED_MARKER = "Круг правок завершён"
 EXHAUSTED_MARKER = "Доведение остановлено"
 NEEDS_HUMAN_LABEL = "needs-human:pr"
 
-# «Review updated until commit abc1234» / «Persistent review updated to latest
-# commit abc1234» — так PR-Agent помечает, до какого коммита ревью актуально.
-_REVIEW_SHA_RE = re.compile(r"commit\s+([0-9a-f]{7,40})", re.IGNORECASE)
+# Как PR-Agent помечает, до какого коммита ревью актуально. Живьём это чаще
+# ССЫЛКА, а не голый sha: «(Review updated until commit
+# https://github.com/o/r/commit/2ecbc5c…)». Разбор только голого sha молча
+# считал ревью отсутствующим — и релиз крутил круги, прося ревью, которое уже
+# было сделано.
+_COMMIT_URL_RE = re.compile(r"/commit/([0-9a-f]{7,40})", re.IGNORECASE)
+_REVIEW_SHA_RE = re.compile(r"commit\s+`?([0-9a-f]{7,40})", re.IGNORECASE)
 
 
 def review_head(comments: list[dict]) -> str:
@@ -49,7 +53,7 @@ def review_head(comments: list[dict]) -> str:
         body = comment.get("body") or ""
         if "review updated" not in body.lower():
             continue
-        match = _REVIEW_SHA_RE.search(body)
+        match = _COMMIT_URL_RE.search(body) or _REVIEW_SHA_RE.search(body)
         if match:
             found = match.group(1)
     return found
