@@ -17,6 +17,7 @@ from typing import Callable
 
 import requests
 
+from poh_delivery import review as review_module
 from poh_delivery.model import PullFacts
 
 _log = logging.getLogger(__name__)
@@ -92,8 +93,12 @@ class GitHubApi:
         pull = self._pull_with_mergeability(repo, number)
         files = [f["filename"] for f in
                  self._get(repo, f"/repos/{repo}/pulls/{number}/files", per_page=100)]
-        approved, decision = self._review_decision(repo, number)
+        approved, decision, review_notes = self._review_decision(repo, number)
         head_sha = pull["head"]["sha"]
+        head_time = self._commit_time(repo, head_sha)
+        labels = [label["name"] for label in pull.get("labels", [])]
+        notes = review_notes + self._comment_notes(repo, number)
+        verdict, reason = review_module.verdict(head_sha, head_time, decision, labels, notes)
         return PullFacts(
             number=number,
             title=pull.get("title", ""),
@@ -104,7 +109,7 @@ class GitHubApi:
             draft=bool(pull.get("draft")),
             approved=approved,
             review_decision=decision,
-            labels=[label["name"] for label in pull.get("labels", [])],
+            labels=labels,
             mergeable=pull.get("mergeable"),
             mergeable_state=pull.get("mergeable_state", "unknown"),
             checks_state=self.checks_state(repo, head_sha),
@@ -113,7 +118,30 @@ class GitHubApi:
             deletions=pull.get("deletions", 0),
             updated_at=pull.get("updated_at", ""),
             body=pull.get("body") or "",
+            head_committed_at=head_time,
+            review_verdict=verdict,
+            review_reason=reason,
         )
+
+    def _commit_time(self, repo: str, sha: str) -> str:
+        """Время текущего коммита ветки — точка отсчёта свежести вердикта ревью."""
+        data = self._get(repo, f"/repos/{repo}/commits/{sha}")
+        commit = data.get("commit", {})
+        return (commit.get("committer") or {}).get("date", "")
+
+    def _comment_notes(self, repo: str, number: int) -> list[dict]:
+        """Комментарии PR в виде, достаточном для вердикта.
+
+        Тело режется: вердикт живёт в первых строках, а целиком комментарии
+        PR-Agent весят десятки килобайт и в payload активности им делать нечего.
+        """
+        raw = self._get(repo, f"/repos/{repo}/issues/{number}/comments", per_page=100)
+        return [{
+            "author": (item.get("user") or {}).get("login", ""),
+            "created_at": item.get("created_at", ""),
+            "body": (item.get("body") or "")[:2000],
+            "kind": "comment",
+        } for item in raw]
 
     def _pull_with_mergeability(self, repo: str, number: int) -> dict:
         """Карточка PR, дочитанная до определённой мержабельности.
@@ -137,7 +165,7 @@ class GitHubApi:
                      repo, number, _MERGEABLE_TRIES)
         return pull
 
-    def _review_decision(self, repo: str, number: int) -> tuple[bool, str]:
+    def _review_decision(self, repo: str, number: int) -> tuple[bool, str, list[dict]]:
         """Одобрен ли PR — по последнему отзыву каждого ревьюера.
 
         Без GraphQL: REST не отдаёт `reviewDecision`, зато отдаёт список
@@ -146,15 +174,25 @@ class GitHubApi:
         """
         reviews = self._get(repo, f"/repos/{repo}/pulls/{number}/reviews", per_page=100)
         latest: dict[str, str] = {}
+        notes: list[dict] = []
         for review in reviews:
             state = review.get("state", "")
             if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                 latest[(review.get("user") or {}).get("login", "")] = state
+            if state == "APPROVED":
+                # Отдельным видом: свежесть APPROVED считается по времени
+                # ОТПРАВКИ ревью, а не по комментариям вокруг него.
+                notes.append({
+                    "author": (review.get("user") or {}).get("login", ""),
+                    "created_at": review.get("submitted_at", ""),
+                    "body": "",
+                    "kind": "review-approved",
+                })
         if any(state == "CHANGES_REQUESTED" for state in latest.values()):
-            return False, "CHANGES_REQUESTED"
+            return False, "CHANGES_REQUESTED", notes
         if any(state == "APPROVED" for state in latest.values()):
-            return True, "APPROVED"
-        return False, "REVIEW_REQUIRED" if not latest else "COMMENTED"
+            return True, "APPROVED", notes
+        return False, ("REVIEW_REQUIRED" if not latest else "COMMENTED"), notes
 
     def checks_state(self, repo: str, sha: str) -> str:
         """Сводное состояние проверок коммита: success | failure | pending | none.

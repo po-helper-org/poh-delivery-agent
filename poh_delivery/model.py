@@ -18,6 +18,8 @@ NOT_APPROVED = "not-approved"    # нет одобрения человека
 CHECKS_RED = "checks-red"        # проверки красные
 CHECKS_PENDING = "checks-pending"  # проверки ещё идут
 DRAFT = "draft"                  # черновик
+REVIEW_BLOCKED = "review-blocked"  # ревью против: замечания в силе либо ждут человека
+REVIEW_PENDING = "review-pending"  # вердикта ревью на текущий коммит ещё нет
 
 
 @dataclass
@@ -49,6 +51,11 @@ class PullFacts:
     deletions: int = 0
     updated_at: str = ""
     body: str = ""
+    # Когда появился текущий коммит ветки — по нему решается, относится ли
+    # вердикт ревью к тому, что вливаем, или к позавчерашнему коду.
+    head_committed_at: str = ""
+    review_verdict: str = "none"
+    review_reason: str = ""
 
 
 @dataclass
@@ -168,3 +175,12 @@ class ReleaseRef:
     release_id: int = 0
     url: str = ""
     tag: str = ""
+
+
+@dataclass
+class ReviewRound:
+    """Итог одного круга ревью-правок, выполненного агентом разработки."""
+
+    settled: bool = False      # правок не потребовалось — вердикт «замечаний нет»
+    changed: bool = False      # правки внесены, нужно новое ревью
+    detail: str = ""

@@ -7,6 +7,7 @@
 LLM в этом контуре пишет текст, а очередь считает код.
 """
 
+from poh_delivery import review
 from poh_delivery.model import (
     CHECKS_PENDING,
     CHECKS_RED,
@@ -14,6 +15,8 @@ from poh_delivery.model import (
     DRAFT,
     ELIGIBLE,
     NOT_APPROVED,
+    REVIEW_BLOCKED,
+    REVIEW_PENDING,
     CheckSpec,
     PullFacts,
     ReleasePlan,
@@ -77,8 +80,18 @@ def classify(pr: PullFacts, approve_labels: tuple[str, ...] = APPROVE_LABELS) ->
         # GitHub считает мержабельность асинхронно. Неизвестность — не разрешение.
         return Verdict(pr.number, CHECKS_PENDING, "GitHub ещё считает мержабельность")
 
+    # Вердикт ревью — последний гейт перед очередью. Одобрение человека говорит
+    # «я хочу это в проде», ревью — «код проверен и замечаний не осталось». Это
+    # разные утверждения, и релиз обязан иметь оба: PR с незакрытыми замечаниями
+    # не становится годным оттого, что кто-то поставил метку.
+    if pr.review_verdict in (review.CHANGES, review.BLOCKED):
+        return Verdict(pr.number, REVIEW_BLOCKED, pr.review_reason or "ревью против мержа")
+    if pr.review_verdict in (review.STALE, review.NONE):
+        return Verdict(pr.number, REVIEW_PENDING,
+                       pr.review_reason or "нет вердикта ревью на текущий коммит")
+
     behind = " (ветка отстала от базы, будет обновлена мержем)" if pr.mergeable_state in _BEHIND_STATES else ""
-    return Verdict(pr.number, ELIGIBLE, f"одобрен, конфликтов нет{behind}")
+    return Verdict(pr.number, ELIGIBLE, f"одобрен, ревью чистое, конфликтов нет{behind}")
 
 
 def risk_of(pr: PullFacts) -> str:

@@ -23,6 +23,7 @@ from poh_delivery.model import (
     PullFacts,
     ReleaseRef,
     RepoState,
+    ReviewRound,
 )
 from poh_delivery.workflow import DeliveryRelease
 
@@ -34,7 +35,8 @@ def _pr(number: int, **kwargs) -> PullFacts:
     base = dict(number=number, title=f"PR {number}", approved=True, mergeable=True,
                 mergeable_state="clean", checks_state="success",
                 files=[f"src/f{number}.mjs"], additions=10, deletions=0,
-                body=f"Closes #{number * 10}")
+                body=f"Closes #{number * 10}", review_verdict="clean",
+                review_reason="круг правок завершён")
     base.update(kwargs)
     return PullFacts(**base)
 
@@ -117,6 +119,36 @@ async def revert(repo: str, merge_sha: str, branch: str) -> str:
     return "revert111"
 
 
+@activity.defn(name="delivery_review_round")
+async def review_round(repo: str, number: int, round_number: int) -> ReviewRound:
+    """Круг «ревью → правки» на стороне Harness.
+
+    Сценарий круга задаётся тестом: список исходов на каждый круг и то, каким
+    становится вердикт по PR после него.
+    """
+    JOURNAL.append(f"review:{number}:{round_number}")
+    plan = STATE.get("review_plan", {}).get(number, [])
+    step = plan[min(round_number - 1, len(plan) - 1)] if plan else {"settled": True,
+                                                                    "verdict": "clean"}
+    verdict = step.get("verdict")
+    if verdict:
+        # Круг меняет состояние PR — прежняя очередь ответов на него больше
+        # не действует, как и в жизни.
+        STATE.get("facts_seq", {}).pop(number, None)
+        STATE["facts"][number] = _pr(number, review_verdict=verdict,
+                                     review_reason=f"вердикт {verdict}")
+    return ReviewRound(settled=step.get("settled", False),
+                       changed=step.get("changed", False),
+                       detail=step.get("detail", ""))
+
+
+@activity.defn(name="delivery_review_exhausted")
+async def review_exhausted(repo: str, number: int, rounds: int) -> None:
+    JOURNAL.append(f"review-exhausted:{number}")
+    STATE["facts"][number] = _pr(number, review_verdict="blocked",
+                                 review_reason="круги ревью кончились")
+
+
 @activity.defn(name="delivery_fix_conflicts")
 async def fix_conflicts(repo: str, number: int) -> str:
     JOURNAL.append(f"fix:{number}")
@@ -128,7 +160,8 @@ async def fix_conflicts(repo: str, number: int) -> str:
 # способ проверить, что слой действительно опционален. Релиз обязан пройти
 # целиком, даже если Harness собран без него.
 ACTIVITIES = [collect_state, read_checks, pull_facts, existing_tags, create_release,
-              update_release, comment, merge, deploy, verify, revert, fix_conflicts]
+              update_release, comment, merge, deploy, verify, revert, fix_conflicts,
+              review_round, review_exhausted]
 
 
 async def _run(pulls, **state) -> dict:
@@ -144,7 +177,8 @@ async def _run(pulls, **state) -> dict:
         async with Worker(client, task_queue="delivery", workflows=[DeliveryRelease],
                           activities=ACTIVITIES,
                           workflow_runner=UnsandboxedWorkflowRunner()), \
-                   Worker(client, task_queue="issue-lifecycle", activities=[fix_conflicts]):
+                   Worker(client, task_queue="issue-lifecycle",
+                          activities=[fix_conflicts, review_round, review_exhausted]):
             return await client.execute_workflow(
                 DeliveryRelease.run,
                 DeliveryRequest(repo="o/r", requested_by="kibarik", issue_number=99),
@@ -251,3 +285,52 @@ async def test_conflict_appearing_at_step_time_goes_to_developer():
 
     assert "fix:2" in JOURNAL
     assert result["shipped"] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_pr_without_verdict_goes_through_review_before_merge():
+    """Ревью — гейт, а не украшение: без вердикта PR не вливается."""
+    result = await _run([_pr(1, review_verdict="none", review_reason="ревью не проводилось")],
+                        review_plan={1: [{"settled": True, "verdict": "clean"}]})
+
+    assert result["shipped"] == [1]
+    assert JOURNAL.index("review:1:1") < JOURNAL.index("merge:1")
+
+
+@pytest.mark.asyncio
+async def test_review_against_merge_stops_the_pr():
+    result = await _run([_pr(2, review_verdict="blocked",
+                             review_reason="метка needs-human:pr")])
+
+    assert result["shipped"] == []
+    assert result["skipped"] == [2]
+    assert "merge:2" not in JOURNAL
+    # Круги ревью не гоняются: вердикт уже вынесен, и он против.
+    assert not [entry for entry in JOURNAL if entry.startswith("review:2")]
+
+
+@pytest.mark.asyncio
+async def test_rounds_run_out_and_pr_goes_to_human():
+    """Три круга правок без вердикта — это не «влить на всякий случай»."""
+    result = await _run([_pr(3, review_verdict="none")],
+                        review_plan={3: [{"changed": True, "verdict": "stale"}]})
+
+    assert result["shipped"] == []
+    assert "review-exhausted:3" in JOURNAL
+    assert "merge:3" not in JOURNAL
+    assert JOURNAL.count("review:3:1") == 1
+    assert "review:3:3" in JOURNAL
+
+
+@pytest.mark.asyncio
+async def test_conflict_fix_forces_a_fresh_review():
+    """Ветку тронул разработчик — прежний вердикт к ней не относится."""
+    conflicted = _pr(4, mergeable=False, mergeable_state="dirty")
+    STALE_AFTER_FIX = _pr(4, review_verdict="stale", review_reason="ревью до прежнего коммита")
+    result = await _run([conflicted],
+                        facts_seq={4: [STALE_AFTER_FIX, STALE_AFTER_FIX]},
+                        review_plan={4: [{"settled": True, "verdict": "clean"}]})
+
+    assert "fix:4" in JOURNAL
+    assert JOURNAL.index("fix:4") < JOURNAL.index("review:4:1")
+    assert result["shipped"] == [4]

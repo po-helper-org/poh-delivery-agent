@@ -16,7 +16,8 @@ from poh_delivery import rules
 def pr(number=1, **kwargs) -> PullFacts:
     base = dict(number=number, title=f"PR {number}", approved=True, mergeable=True,
                 mergeable_state="clean", checks_state="success", files=["src/a.mjs"],
-                additions=10, deletions=1)
+                additions=10, deletions=1, review_verdict="clean",
+                review_reason="круг правок завершён")
     base.update(kwargs)
     return PullFacts(**base)
 
@@ -117,3 +118,38 @@ def test_unstable_pr_waits_even_if_commit_summary_is_empty():
     verdict = rules.classify(pr(mergeable=True, mergeable_state="unstable",
                                 checks_state="none"))
     assert verdict.verdict == CHECKS_PENDING
+
+
+def test_review_against_merge_blocks_even_with_human_approval():
+    """Метка человека и вердикт ревью — разные утверждения, нужны оба.
+
+    «Я хочу это в проде» не отменяет «в коде остались замечания».
+    """
+    verdict = rules.classify(pr(labels=["ready-to-ship"], review_verdict="blocked",
+                                review_reason="метка needs-human:pr"))
+    assert verdict.verdict == "review-blocked"
+    assert "needs-human:pr" in verdict.reason
+
+
+def test_changes_requested_blocks():
+    verdict = rules.classify(pr(review_verdict="changes",
+                                review_reason="ревьюер запросил изменения"))
+    assert verdict.verdict == "review-blocked"
+
+
+def test_stale_verdict_sends_pr_back_to_review():
+    """Вердикт про прежний коммит мерж не открывает."""
+    verdict = rules.classify(pr(review_verdict="stale",
+                                review_reason="ревью актуально до abc1234"))
+    assert verdict.verdict == "review-pending"
+
+
+def test_pr_without_review_is_not_shipped():
+    assert rules.classify(pr(review_verdict="none")).verdict == "review-pending"
+
+
+def test_conflict_is_reported_before_review():
+    """Ревью конфликтующей ветки бессмысленно — сначала конфликт."""
+    verdict = rules.classify(pr(mergeable=False, mergeable_state="dirty",
+                                review_verdict="none"))
+    assert verdict.verdict == CONFLICT
