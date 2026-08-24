@@ -46,6 +46,10 @@ MERGE_METHOD = "squash"
 # развёл конфликт с первого раза, второй круг на том же входе даст то же самое,
 # а платный прогон агента — не то, что стоит повторять «на всякий случай».
 CONFLICT_ROUNDS = 1
+# Сколько ждать проверок после круга правок. Пуш в ветку перезапускает CI, и
+# сразу после него у головного коммита проверок нет вовсе — «нет проверок» и
+# «проверки прошли» тут неразличимы, а цена ошибки — влить непроверенное.
+CONFLICT_CHECK_WAIT_MINUTES = 15
 
 _READ = RetryPolicy(maximum_attempts=3)
 # Мутации не ретраятся вслепую: повторный мерж по уже влитому PR вернёт 405, а
@@ -235,9 +239,18 @@ class DeliveryRelease:
                     retry_policy=_WRITE)
             except Exception:
                 return None
-            return await workflow.execute_activity(
+
+            facts: PullFacts = await workflow.execute_activity(
                 "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
                 start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+            waited = 0
+            while facts.checks_state in ("pending", "none") and waited < CONFLICT_CHECK_WAIT_MINUTES:
+                await workflow.sleep(timedelta(minutes=1))
+                waited += 1
+                facts = await workflow.execute_activity(
+                    "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
+                    start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+            return facts
         return None
 
     async def _rollback(self, repo: str, merge_sha: str, branch: str,
