@@ -56,6 +56,11 @@ async def read_checks(repo: str, ref: str) -> ChecksBundle:
 @activity.defn(name="delivery_pull_facts")
 async def pull_facts(repo: str, number: int) -> PullFacts:
     JOURNAL.append(f"facts:{number}")
+    # Очередь ответов на один PR: GitHub отдаёт состояние не сразу, и релиз
+    # обязан пережить «ещё считаю» между двумя чтениями.
+    queue = STATE.get("facts_seq", {}).get(number)
+    if queue:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
     return STATE["facts"][number]
 
 
@@ -210,3 +215,30 @@ async def test_nothing_to_ship_keeps_release_draft():
     assert result["published"] is False
     assert result["skipped"] == [4]
     assert "publish:True" not in JOURNAL
+
+
+@pytest.mark.asyncio
+async def test_pending_mergeability_is_waited_out_not_skipped():
+    """`mergeable=None` — «ответ ещё не готов», а не «конфликта нет».
+
+    Живой прогон: после мержа соседа GitHub пересчитывает мержабельность, и PR
+    #98 выпал из релиза с «ещё считает», хотя был готов.
+    """
+    unknown = _pr(1, mergeable=None, mergeable_state="unknown")
+    ready = _pr(1)
+    result = await _run([_pr(1)], facts_seq={1: [unknown, unknown, ready]})
+
+    assert result["shipped"] == [1]
+    assert JOURNAL.count("facts:1") >= 3   # два «ещё считаю» и один готовый
+
+
+@pytest.mark.asyncio
+async def test_conflict_appearing_at_step_time_goes_to_developer():
+    """Конфликт от только что влитого соседа — повод позвать разработчика,
+    а не пропустить шаг."""
+    conflicted = _pr(2, mergeable=False, mergeable_state="dirty")
+    result = await _run([_pr(1), _pr(2)],
+                        facts_seq={2: [conflicted, _pr(2)]})
+
+    assert "fix:2" in JOURNAL
+    assert result["shipped"] == [1, 2]

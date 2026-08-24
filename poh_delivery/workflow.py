@@ -50,6 +50,12 @@ CONFLICT_ROUNDS = 1
 # сразу после него у головного коммита проверок нет вовсе — «нет проверок» и
 # «проверки прошли» тут неразличимы, а цена ошибки — влить непроверенное.
 CONFLICT_CHECK_WAIT_MINUTES = 15
+# Сколько ждать, пока GitHub досчитает мержабельность. Он считает её лениво и
+# ПЕРЕсчитывает после каждого мержа в базу — то есть ровно тогда, когда релиз
+# переходит к следующему шагу. На живом прогоне #98 из-за этого выпал из релиза
+# с «ещё считает», хотя конфликта у него не было.
+MERGEABILITY_WAIT_TRIES = 9
+MERGEABILITY_WAIT_SECONDS = 20
 
 _READ = RetryPolicy(maximum_attempts=3)
 # Мутации не ретраятся вслепую: повторный мерж по уже влитому PR вернёт 405, а
@@ -138,11 +144,18 @@ class DeliveryRelease:
         previous_sha = state.base_sha
 
         for step in plan.steps:
-            fresh: PullFacts = await workflow.execute_activity(
-                "delivery_pull_facts", args=[repo, step.pr_number],
-                result_type=PullFacts,
-                start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+            fresh = await self._settled_facts(repo, step.pr_number)
             fresh_verdict = rules.classify(fresh)
+
+            if fresh_verdict.verdict == CONFLICT:
+                # Конфликт мог появиться от только что влитого соседа. Это не
+                # повод бросать PR: агент разработки уже подключён к релизу,
+                # и правильный ответ — отдать ветку ему, а не пропустить шаг.
+                fixed = await self._delegate_conflict(repo, step.pr_number)
+                if fixed is not None:
+                    fresh = fixed
+                    fresh_verdict = rules.classify(fresh)
+
             if fresh_verdict.verdict != ELIGIBLE:
                 # Состояние успело измениться между планом и шагом — законный
                 # случай, а не авария: сосед по очереди мог тронуть те же файлы.
@@ -216,6 +229,25 @@ class DeliveryRelease:
         return self._summary(plan, outcomes, release, published=True)
 
     # --- вспомогательное ---
+
+    async def _settled_facts(self, repo: str, number: int) -> PullFacts:
+        """Факты PR, дождавшись, пока GitHub досчитает мержабельность.
+
+        `mergeable=None` — не «конфликта нет» и не «конфликт есть», а «ответ
+        ещё не готов». Решать по нему нельзя, а пропускать шаг из-за него —
+        значит терять готовый PR на ровном месте.
+        """
+        facts: PullFacts = await workflow.execute_activity(
+            "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
+            start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+        tries = 0
+        while facts.mergeable is None and tries < MERGEABILITY_WAIT_TRIES:
+            await workflow.sleep(timedelta(seconds=MERGEABILITY_WAIT_SECONDS))
+            tries += 1
+            facts = await workflow.execute_activity(
+                "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
+                start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+        return facts
 
     async def _comment(self, repo: str, number: int, body: str) -> None:
         await workflow.execute_activity(
