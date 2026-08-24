@@ -24,10 +24,12 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from poh_delivery import render, rules
+    from poh_delivery import render, review, rules
     from poh_delivery.model import (
         CONFLICT,
         ELIGIBLE,
+        REVIEW_BLOCKED,
+        REVIEW_PENDING,
         CheckResult,
         ChecksBundle,
         DeliveryRequest,
@@ -35,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
         PullFacts,
         ReleaseRef,
         RepoState,
+        ReviewRound,
         StepOutcome,
         Verdict,
     )
@@ -56,6 +59,13 @@ CONFLICT_CHECK_WAIT_MINUTES = 15
 # с «ещё считает», хотя конфликта у него не было.
 MERGEABILITY_WAIT_TRIES = 9
 MERGEABILITY_WAIT_SECONDS = 20
+# Сколько кругов «ревью → правки» гонять по одному PR за релиз. Три — потолок
+# протокола для доведения PR: агент, который третий раз не сходится с ревью,
+# дальше не сойдётся, он спорит, а не исправляет. Такой PR уходит человеку.
+REVIEW_ROUNDS = 3
+# Пауза перед перечитыванием состояния после запроса ревью: PR-Agent отвечает
+# минутами, и опрашивать его чаще — только жечь лимиты GitHub.
+REVIEW_POLL_SECONDS = 90
 
 _READ = RetryPolicy(maximum_attempts=3)
 # Мутации не ретраятся вслепую: повторный мерж по уже влитому PR вернёт 405, а
@@ -94,7 +104,8 @@ class DeliveryRelease:
 
         eligible = [by_number[v.number] for v in verdicts if v.verdict == ELIGIBLE]
         conflicted = [v for v in verdicts if v.verdict == CONFLICT]
-        skipped = [v for v in verdicts if v.verdict not in (ELIGIBLE, CONFLICT)]
+        needs_review = [v for v in verdicts if v.verdict == REVIEW_PENDING]
+        skipped = [v for v in verdicts if v.verdict not in (ELIGIBLE, CONFLICT, REVIEW_PENDING)]
 
         delegated: list[Verdict] = []
         for verdict in conflicted:
@@ -103,12 +114,26 @@ class DeliveryRelease:
                 delegated.append(verdict)
                 continue
             fresh_verdict = rules.classify(fixed)
+            if fresh_verdict.verdict == REVIEW_PENDING:
+                # Ветку тронул агент разработки — прежний вердикт ревью к ней
+                # не относится. Замыкаем цикл: разработчик → ревью → вердикт.
+                fixed = await self._review_gate(repo, verdict.number, fixed)
+                fresh_verdict = rules.classify(fixed)
             if fresh_verdict.verdict == ELIGIBLE:
                 eligible.append(fixed)
                 by_number[fixed.number] = fixed
             else:
-                delegated.append(Verdict(verdict.number, CONFLICT,
-                                         f"конфликт после круга правок: {fresh_verdict.reason}"))
+                delegated.append(Verdict(verdict.number, fresh_verdict.verdict,
+                                         f"после круга правок: {fresh_verdict.reason}"))
+
+        for verdict in needs_review:
+            reviewed = await self._review_gate(repo, verdict.number, by_number[verdict.number])
+            by_number[verdict.number] = reviewed
+            fresh_verdict = rules.classify(reviewed)
+            if fresh_verdict.verdict == ELIGIBLE:
+                eligible.append(reviewed)
+            else:
+                skipped.append(fresh_verdict)
 
         # --- Шаг 4: очередь, релиз, ссылка во всех PR ---
         tags: list[str] = await workflow.execute_activity(
@@ -153,6 +178,12 @@ class DeliveryRelease:
         for step in plan.steps:
             fresh = await self._settled_facts(repo, step.pr_number)
             fresh_verdict = rules.classify(fresh)
+
+            if fresh_verdict.verdict == REVIEW_PENDING:
+                # Вердикт мог устареть между планом и шагом: сосед по очереди
+                # влит, ветка обновлена, ревьюер этого кода не видел.
+                fresh = await self._review_gate(repo, step.pr_number, fresh)
+                fresh_verdict = rules.classify(fresh)
 
             if fresh_verdict.verdict == CONFLICT:
                 # Конфликт мог появиться от только что влитого соседа. Это не
@@ -331,18 +362,65 @@ class DeliveryRelease:
             except Exception:
                 return None
 
-            facts: PullFacts = await workflow.execute_activity(
+            return await self._wait_for_checks(repo, number)
+        return None
+
+    async def _wait_for_checks(self, repo: str, number: int) -> PullFacts:
+        """Дождаться, пока проверки нового коммита станут определёнными.
+
+        Пуш в ветку перезапускает CI, и сразу после него у головного коммита
+        проверок нет вовсе: «нет проверок» и «проверки прошли» в этот момент
+        неразличимы, а цена ошибки — влить непроверенное.
+        """
+        facts: PullFacts = await workflow.execute_activity(
+            "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
+            start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
+        waited = 0
+        while facts.checks_state in ("pending", "none") and waited < CONFLICT_CHECK_WAIT_MINUTES:
+            await workflow.sleep(timedelta(minutes=1))
+            waited += 1
+            facts = await workflow.execute_activity(
                 "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
                 start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
-            waited = 0
-            while facts.checks_state in ("pending", "none") and waited < CONFLICT_CHECK_WAIT_MINUTES:
-                await workflow.sleep(timedelta(minutes=1))
-                waited += 1
-                facts = await workflow.execute_activity(
-                    "delivery_pull_facts", args=[repo, number], result_type=PullFacts,
-                    start_to_close_timeout=timedelta(minutes=3), retry_policy=_READ)
-            return facts
-        return None
+        return facts
+
+    async def _review_gate(self, repo: str, number: int, facts: PullFacts) -> PullFacts:
+        """Круг «ревью → правки», пока не появится вердикт по текущему коммиту.
+
+        Это и есть блокирующее ревью: пока вердикта нет, PR в очередь не
+        попадает, а с вердиктом «замечания в силе» не попадает вовсе. Работу
+        внутри круга делает агент разработки Harness — тот же, что чинит
+        конфликты; Delivery-Agent только держит цикл и считает круги.
+        """
+        for round_number in range(1, REVIEW_ROUNDS + 1):
+            try:
+                result: ReviewRound = await workflow.execute_activity(
+                    "delivery_review_round", args=[repo, number, round_number],
+                    task_queue=HARNESS_TASK_QUEUE, result_type=ReviewRound,
+                    start_to_close_timeout=timedelta(minutes=60),
+                    heartbeat_timeout=timedelta(minutes=10), retry_policy=_WRITE)
+            except Exception:
+                # Круг сорвался — вердикта нет, значит и мержа нет. Молчаливого
+                # «поехали дальше» здесь быть не должно.
+                return await self._settled_facts(repo, number)
+
+            if result.changed:
+                # Правки внесены, ревью запрошено — ждём CI по новому коммиту,
+                # иначе следующий круг будет читать ревью прежнего кода.
+                facts = await self._wait_for_checks(repo, number)
+            else:
+                await workflow.sleep(timedelta(seconds=REVIEW_POLL_SECONDS))
+                facts = await self._settled_facts(repo, number)
+
+            if facts.review_verdict in (review.CLEAN, review.BLOCKED, review.CHANGES):
+                return facts
+
+        # Круги кончились, а вердикта нет: PR уходит человеку с меткой и итогом.
+        await workflow.execute_activity(
+            "delivery_review_exhausted", args=[repo, number, REVIEW_ROUNDS],
+            task_queue=HARNESS_TASK_QUEUE,
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=_WRITE)
+        return await self._settled_facts(repo, number)
 
     async def _rollback(self, repo: str, merge_sha: str, branch: str,
                         previous_sha: str, bundle: ChecksBundle) -> bool:
