@@ -13,7 +13,7 @@ import logging
 
 from temporalio import activity
 
-from poh_delivery import ports, prod as prod_module
+from poh_delivery import memory, ports, prod as prod_module
 from poh_delivery.model import (
     CheckResult,
     CheckSpec,
@@ -108,6 +108,32 @@ def revert(repo: str, merge_sha: str, branch: str) -> str:
     return ports.github().revert_merge(repo, merge_sha, branch)
 
 
+@activity.defn(name="delivery_memory_rules")
+def memory_rules(repo: str) -> dict:
+    """Правила и накопленный опыт организации для роли поставки.
+
+    Отдельной активностью, а не чтением внутри воркфлоу: воркфлоу не ходит в
+    сеть и не читает окружение — иначе воспроизведение истории брало бы другое
+    значение и роняло идущий прогон недетерминизмом.
+
+    Слой не подключён либо недоступен — пустой блок. План релиза при этом
+    собирается ровно как раньше.
+    """
+    got = memory.rules(memory.DELIVERY, repo=repo)
+    return {"text": got.text, "ids": got.ids}
+
+
+@activity.defn(name="delivery_capture_episode")
+def capture_episode(episode: dict) -> bool:
+    """Запись об итерации поставки — слою саморефлексии.
+
+    Пишется то, что уже известно коду: что отгружали, чем кончилось, какие
+    правила при этом действовали. Оценивать здесь нечего — факты о том, пережил
+    ли релиз контакт с продом, созреют позже, и их соберёт отложенный проход.
+    """
+    return memory.put_episode(episode)
+
+
 @activity.defn(name="delivery_prod_sha")
 def prod_sha() -> str:
     return ports.prod().current_sha()
@@ -126,4 +152,6 @@ ALL = [
     verify,
     revert,
     prod_sha,
+    memory_rules,
+    capture_episode,
 ]

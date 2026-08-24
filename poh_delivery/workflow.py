@@ -128,7 +128,13 @@ class DeliveryRelease:
             await self._finish_empty(repo, request, plan)
             return self._summary(plan, [], ReleaseRef(), published=False)
 
-        body = render.plan_md(plan, request.requested_by, info.run_id, info.workflow_id)
+        # Накопленный опыт организации — в план, который читает человек перед
+        # одобрением выкатки. Слой не подключён — блок пуст, и документ
+        # собирается ровно как раньше.
+        org_rules, org_ids = await self._org_rules(repo)
+
+        body = render.plan_md(plan, request.requested_by, info.run_id,
+                              info.workflow_id, org_rules=org_rules)
         release: ReleaseRef = await workflow.execute_activity(
             "delivery_create_release",
             args=[repo, plan.tag, plan.title, body, state.default_branch],
@@ -215,7 +221,8 @@ class DeliveryRelease:
             break
 
         # --- Шаг 6-7: отчёт в релиз и завершение ---
-        report = render.plan_md(plan, request.requested_by, info.run_id, info.workflow_id)
+        report = render.plan_md(plan, request.requested_by, info.run_id,
+                                info.workflow_id, org_rules=org_rules)
         report += "\n---\n\n" + render.report_md(
             plan, outcomes, bodies, info.run_id, info.workflow_id,
             workflow.now().isoformat(timespec="seconds"))
@@ -227,7 +234,58 @@ class DeliveryRelease:
             await self._comment(repo, request.issue_number,
                                 render.summary_comment(plan, outcomes, release.url))
 
+        await self._capture(repo, request, plan, outcomes, org_ids, info)
         return self._summary(plan, outcomes, release, published=True)
+
+    async def _org_rules(self, repo: str) -> tuple[str, list]:
+        """Правила организации от слоя саморефлексии.
+
+        Слой ОПЦИОНАЛЕН, и его отказ не имеет права стоить релиза. Отдельный
+        повод для перехвата: активность может быть не зарегистрирована вовсе —
+        Harness подключает Delivery-Agent как внешний модуль, и его сборка
+        может быть старше этой.
+        """
+        try:
+            org: dict = await workflow.execute_activity(
+                "delivery_memory_rules", repo, result_type=dict,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=1))
+        except Exception as e:                           # noqa: BLE001 — см. докстроку
+            workflow.logger.warning("правила организации недоступны: %s", e)
+            return "", []
+        return org.get("text") or "", org.get("ids") or []
+
+    async def _capture(self, repo, request, plan, outcomes, org_ids, info) -> None:
+        """Запись об итерации поставки — слою саморефлексии.
+
+        Отказ слоя не имеет права стоить релиза: он уже выкачен, а запись —
+        побочный результат. Поэтому исключение гасится здесь и не поднимается
+        в воркфлоу.
+        """
+        ok_steps = sum(1 for o in outcomes if getattr(o, "ok", False))
+        episode = {
+            "run_id": info.workflow_id,
+            "repo": repo,
+            "issue": request.issue_number or 0,
+            "phase": "delivery",
+            "agent": "delivery",
+            "finished_at": workflow.now().isoformat(timespec="seconds"),
+            "intent": f"отгрузить {len(plan.steps)} PR тегом {plan.tag}",
+            "rules_injected": org_ids,
+            "artifacts": {
+                "steps": len(plan.steps),
+                "steps_ok": ok_steps,
+                "rolled_back": len(outcomes) - ok_steps,
+                "delegated": len(plan.delegated),
+                "skipped": len(plan.skipped),
+            },
+        }
+        try:
+            await workflow.execute_activity(
+                "delivery_capture_episode", episode, result_type=bool,
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=_READ)
+        except Exception as e:                           # noqa: BLE001 — см. докстроку
+            workflow.logger.warning("запись об итерации поставки не отдана: %s", e)
 
     # --- вспомогательное ---
 
