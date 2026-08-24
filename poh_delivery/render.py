@@ -45,8 +45,18 @@ def _checks_block(checks: list[CheckSpec], source: str) -> str:
     return "\n".join(lines)
 
 
-def plan_md(plan: ReleasePlan, requested_by: str, run_id: str, workflow_id: str) -> str:
-    """Тело релиза до выкатки: что, в каком порядке, чем проверяем, как откатываем."""
+def plan_md(plan: ReleasePlan, requested_by: str, run_id: str, workflow_id: str,
+            org_rules: str = "") -> str:
+    """Тело релиза до выкатки: что, в каком порядке, чем проверяем, как откатываем.
+
+    `org_rules` — блок правил и накопленного опыта организации от слоя
+    саморефлексии. Пусто (слой не подключён) — документ собирается ровно как
+    раньше, ни на символ не отличаясь.
+
+    Блок кладётся в план, который читает ЧЕЛОВЕК перед одобрением выкатки: это
+    и есть способ, которым накопленное знание о ландшафте влияет на решение.
+    Модели в этом контуре нет и не будет — очередь считает код.
+    """
     out: list[str] = []
     out.append("## План релиза")
     out.append("")
@@ -100,6 +110,12 @@ def plan_md(plan: ReleasePlan, requested_by: str, run_id: str, workflow_id: str)
         for verdict in plan.skipped:
             label = _VERDICT_RU.get(verdict.verdict, verdict.verdict)
             out.append(f"- #{verdict.number} — {label}: {verdict.reason}")
+        out.append("")
+
+    if org_rules.strip():
+        out.append("### Накопленный опыт этой организации")
+        out.append("")
+        out.append(org_rules.strip())
         out.append("")
 
     return "\n".join(out).rstrip() + "\n"

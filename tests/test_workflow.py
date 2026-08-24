@@ -124,6 +124,9 @@ async def fix_conflicts(repo: str, number: int) -> str:
     return "конфликт разрешён"
 
 
+# Активностей слоя саморефлексии здесь НЕТ намеренно: их отсутствие — это
+# способ проверить, что слой действительно опционален. Релиз обязан пройти
+# целиком, даже если Harness собран без него.
 ACTIVITIES = [collect_state, read_checks, pull_facts, existing_tags, create_release,
               update_release, comment, merge, deploy, verify, revert, fix_conflicts]
 
