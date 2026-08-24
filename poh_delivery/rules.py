@@ -27,6 +27,14 @@ APPROVE_LABELS = ("ready-to-ship", "approved-to-merge")
 
 # Состояния мержабельности GitHub, означающие конфликт с базой.
 _CONFLICT_STATES = ("dirty",)
+# `blocked` — мерж запрещают правила ветки (нет обязательного ревью, не пройден
+# обязательный статус). Решение здесь за человеком и настройками репозитория, а
+# не за агентом: он не имеет права обходить защиту ветки.
+_BLOCKED_STATES = ("blocked",)
+# `unstable` — мержить GitHub разрешает, но какая-то проверка красная или ещё
+# идёт (необязательная). Для релиза это НЕ разрешение: «необязательная» она для
+# правил ветки, а не для того, кто отвечает за прод.
+_UNSTABLE_STATES = ("unstable",)
 # `behind` — не конфликт: ветка просто отстала, мерж база-в-ветку не нужен,
 # GitHub вливает такой PR сам. Отдельным состоянием оно интересно только тем,
 # что проверки в PR прогонялись НЕ на текущей базе — это ловит верификация
@@ -50,10 +58,20 @@ def classify(pr: PullFacts, approve_labels: tuple[str, ...] = APPROVE_LABELS) ->
     if pr.mergeable is False or pr.mergeable_state in _CONFLICT_STATES:
         return Verdict(pr.number, CONFLICT, f"конфликт с базой (state={pr.mergeable_state})")
 
+    if pr.mergeable_state in _BLOCKED_STATES:
+        return Verdict(pr.number, NOT_APPROVED,
+                       "мерж запрещён правилами ветки (state=blocked)")
+
     if pr.checks_state == "failure":
         return Verdict(pr.number, CHECKS_RED, "проверки красные")
     if pr.checks_state == "pending":
         return Verdict(pr.number, CHECKS_PENDING, "проверки ещё идут")
+    if pr.mergeable_state in _UNSTABLE_STATES:
+        # Состояние ветки важнее сводки по коммиту: сводка считает check-runs
+        # головного коммита, а `unstable` GitHub ставит и по проверкам, которые
+        # в эту сводку не попали.
+        return Verdict(pr.number, CHECKS_PENDING,
+                       "проверки не в порядке: GitHub держит PR в состоянии unstable")
 
     if pr.mergeable is None and pr.mergeable_state == "unknown":
         # GitHub считает мержабельность асинхронно. Неизвестность — не разрешение.

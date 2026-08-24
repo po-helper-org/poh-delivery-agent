@@ -100,3 +100,20 @@ def test_next_tag_counts_within_day():
     assert rules.next_tag([], "2026-08-21") == "release-2026-08-21.1"
     assert rules.next_tag(["release-2026-08-21.1"], "2026-08-21") == "release-2026-08-21.2"
     assert rules.next_tag(["release-2026-08-20.9"], "2026-08-21") == "release-2026-08-21.1"
+
+
+def test_branch_protection_block_is_not_ours_to_bypass():
+    verdict = rules.classify(pr(mergeable=True, mergeable_state="blocked"))
+    assert verdict.verdict == NOT_APPROVED
+    assert "правилами ветки" in verdict.reason
+
+
+def test_unstable_pr_waits_even_if_commit_summary_is_empty():
+    """GitHub держит PR `unstable`, а сводка по коммиту пуста — это не зелёный свет.
+
+    Живой случай на демо-стенде: `mergeable_state=unstable`, `check-runs` по
+    головному коммиту не отдают ничего. По одной сводке PR уехал бы в релиз.
+    """
+    verdict = rules.classify(pr(mergeable=True, mergeable_state="unstable",
+                                checks_state="none"))
+    assert verdict.verdict == CHECKS_PENDING
