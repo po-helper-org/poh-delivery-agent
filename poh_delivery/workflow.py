@@ -214,6 +214,18 @@ class DeliveryRelease:
                 "delivery_merge", args=[repo, step.pr_number, MERGE_METHOD],
                 start_to_close_timeout=timedelta(minutes=5), retry_policy=_WRITE)
 
+            # Проверки перечитываются из ВЛИТОГО состояния, а не из того, что
+            # было на старте релиза. PR, который меняет поведение, обязан менять
+            # и `.delivery/checks.json`; читая старый файл, релиз проверял бы
+            # свежий код вчерашним контрактом и откатывал сам себя. Живой
+            # случай: `/healthz` стал отдавать `status`, проверка ждала `ok`.
+            merged_bundle: ChecksBundle = await workflow.execute_activity(
+                "delivery_read_checks", args=[repo, merged_sha],
+                result_type=ChecksBundle,
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_READ)
+            if merged_bundle.checks or merged_bundle.service:
+                bundle = merged_bundle
+
             deployed: DeployResult = await workflow.execute_activity(
                 "delivery_deploy", args=[repo, merged_sha, bundle.service],
                 result_type=DeployResult,

@@ -50,7 +50,11 @@ async def collect_state(repo: str) -> RepoState:
 
 @activity.defn(name="delivery_read_checks")
 async def read_checks(repo: str, ref: str) -> ChecksBundle:
-    return ChecksBundle(source=".delivery/checks.json@main",
+    JOURNAL.append(f"checks:{ref}")
+    override = STATE.get("checks_at", {}).get(ref)
+    if override is not None:
+        return override
+    return ChecksBundle(source=f".delivery/checks.json@{ref}",
                         service={"port": 8080, "start": "node src/server.mjs"},
                         checks=[CheckSpec(name="quote-base")])
 
@@ -199,9 +203,10 @@ async def test_happy_path_ships_in_planned_order():
     assert result["shipped"] == [5, 2]
     merges = [entry for entry in JOURNAL if entry.startswith("merge:")]
     assert merges == ["merge:5", "merge:2"]
-    # Ровно тот порядок, что записан в плане: мерж → выкатка → проверка.
+    # Ровно тот порядок, что записан в плане: мерж → контракт влитого состояния
+    # → выкатка → проверка.
     window = JOURNAL[JOURNAL.index("merge:5"):]
-    assert window[:3] == ["merge:5", "deploy:merged5", "verify"]
+    assert window[:4] == ["merge:5", "checks:merged5", "deploy:merged5", "verify"]
     assert "publish:True" in JOURNAL
 
 
@@ -356,3 +361,22 @@ async def test_waiting_for_review_does_not_burn_fix_rounds():
 
     assert result["shipped"] == [5]
     assert "review-exhausted:5" not in JOURNAL
+
+
+@pytest.mark.asyncio
+async def test_checks_are_reread_from_the_merged_state():
+    """PR, меняющий поведение, меняет и проверки — читать надо ВЛИТОЕ.
+
+    Живой случай на демо-стенде: `/healthz` стал отдавать `status` вместо `ok`,
+    а релиз проверял свежий код вчерашним контрактом и откатывал сам себя.
+    """
+    new_bundle = ChecksBundle(source=".delivery/checks.json@merged1",
+                              service={"port": 8080, "start": "node src/server.mjs"},
+                              checks=[CheckSpec(name="healthz-v2")])
+    result = await _run([_pr(1)], checks_at={"merged1": new_bundle})
+
+    assert result["shipped"] == [1]
+    # Сначала контракт базы, после мержа — контракт влитого состояния.
+    assert JOURNAL.index("checks:main") < JOURNAL.index("merge:1")
+    assert JOURNAL.index("merge:1") < JOURNAL.index("checks:merged1")
+    assert JOURNAL.index("checks:merged1") < JOURNAL.index("verify")
