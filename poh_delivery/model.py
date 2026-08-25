@@ -122,6 +122,16 @@ class ReleasePlan:
 
 
 @dataclass
+class ObservationResult:
+    """Результат наблюдения за контейнером после выкатки."""
+    
+    duration: int
+    alive: bool
+    restarts: int
+    detail: str = ""
+
+
+@dataclass
 class StepOutcome:
     pr_number: int
     ok: bool = False
@@ -130,6 +140,7 @@ class StepOutcome:
     checks: list[CheckResult] = field(default_factory=list)
     rolled_back: bool = False
     detail: str = ""
+    observation: ObservationResult | None = None
 
 
 @dataclass

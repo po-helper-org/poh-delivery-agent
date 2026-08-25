@@ -34,6 +34,7 @@ with workflow.unsafe.imports_passed_through():
         ChecksBundle,
         DeliveryRequest,
         DeployResult,
+        ObservationResult,
         PullFacts,
         ReleaseRef,
         RepoState,
@@ -45,6 +46,7 @@ with workflow.unsafe.imports_passed_through():
 # Очередь Harness: конфликты чинит агент разработки, который живёт там.
 HARNESS_TASK_QUEUE = "issue-lifecycle"
 MERGE_METHOD = "squash"
+
 # Сколько раз отдавать один PR разработчику за релиз. Один: если круг правок не
 # развёл конфликт с первого раза, второй круг на том же входе даст то же самое,
 # а платный прогон агента — не то, что стоит повторять «на всякий случай».
@@ -231,36 +233,71 @@ class DeliveryRelease:
                 result_type=DeployResult,
                 start_to_close_timeout=timedelta(minutes=15), retry_policy=_WRITE)
 
+            # Порядок проверок: выкатка → прогон проверок → окно наблюдения → повторный прогон проверок
             checks = []
-            if deployed.ok:
+            if deployed.ok and bundle.checks:
+                # Первый прогон проверок: сразу после выкатки, чтобы явно сломанное изменение откатить быстро
                 checks = await workflow.execute_activity(
                     "delivery_verify", args=[bundle.checks, bundle.service],
                     result_type=List[CheckResult],
                     start_to_close_timeout=timedelta(minutes=10), retry_policy=_READ)
 
-            failed = [c for c in checks if not c.ok]
-            if deployed.ok and not failed:
+            observation: ObservationResult | None = None
+            if deployed.ok and not [c for c in checks if not c.ok]:
+                # Если первый прогон прошёл, запускаем окно наблюдения
+                observe_seconds = await workflow.execute_activity(
+                    "delivery_get_observe_seconds", result_type=int,
+                    start_to_close_timeout=timedelta(minutes=1), retry_policy=_READ)
+                if observe_seconds > 0:
+                    observation = await workflow.execute_activity(
+                        "delivery_observe", args=[observe_seconds, bundle.service],
+                        result_type=ObservationResult,
+                        start_to_close_timeout=timedelta(minutes=20), retry_policy=_READ)
+
+            # Повторный прогон проверок после окна наблюдения
+            final_checks = []
+            if deployed.ok and not [c for c in checks if not c.ok] and (observation is None or observation.alive):
+                if bundle.checks:
+                    final_checks = await workflow.execute_activity(
+                        "delivery_verify", args=[bundle.checks, bundle.service],
+                        result_type=List[CheckResult],
+                        start_to_close_timeout=timedelta(minutes=10), retry_policy=_READ)
+            else:
+                final_checks = checks  # Если окно не было или провалилось, используем первый прогон
+
+            # Проверяем итоговый результат после всех этапов
+            failed = [c for c in final_checks if not c.ok]
+            observation_failed = observation is not None and not observation.alive
+            
+            if deployed.ok and not failed and not observation_failed:
                 outcomes.append(StepOutcome(
                     pr_number=step.pr_number, ok=True, merged_sha=merged_sha,
-                    deployed=True, checks=checks,
-                    detail=deployed.detail))
+                    deployed=True, checks=final_checks,
+                    detail=deployed.detail, observation=observation))
                 previous_sha = merged_sha
+                obs_note = f", окно наблюдения {observation.duration}с прожито" if observation else ""
                 await self._comment(repo, step.pr_number, (
                     f"**Delivery-Agent: шаг {step.order} отгружен.**\n\n"
-                    f"Влит в `{plan.repo}` как `{merged_sha[:12]}`, выкачен на прод-контур, "
-                    f"проверки зелёные ({len(checks)} шт.). Релиз: {release.url}"))
+                    f"Влит в `{plan.repo}` как `{merged_sha[:12]}`, выкачен на прод-контур{obs_note}, "
+                    f"проверки зелёные ({len(final_checks)} шт.). Релиз: {release.url}"))
                 continue
 
             # --- Провал: откат и остановка релиза ---
-            reason = deployed.detail if not deployed.ok else "; ".join(
-                f"{c.name}: {c.detail}" for c in failed)
+            if not deployed.ok:
+                reason = deployed.detail
+            elif observation_failed and observation:
+                reason = f"сервис не пережил окно наблюдения: {observation.detail}"
+            else:
+                reason = "; ".join(f"{c.name}: {c.detail}" for c in failed)
+            
             rolled = await self._rollback(repo, merged_sha, state.default_branch,
                                           previous_sha, bundle)
             outcomes.append(StepOutcome(
                 pr_number=step.pr_number, ok=False, merged_sha=merged_sha,
-                deployed=deployed.ok, checks=checks, rolled_back=rolled,
+                deployed=deployed.ok, checks=final_checks, rolled_back=rolled,
                 detail=reason + ("; изменение откачено" if rolled
-                                 else "; ОТКАТ НЕ УДАЛСЯ — нужна рука человека")))
+                                 else "; ОТКАТ НЕ УДАЛСЯ — нужна рука человека"),
+                observation=observation))
             await self._comment(repo, step.pr_number, (
                 f"**Delivery-Agent: шаг {step.order} отменён.**\n\n"
                 f"Причина: {reason}\n\n"

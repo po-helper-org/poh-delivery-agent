@@ -20,8 +20,9 @@ import subprocess
 import time
 
 import requests
+from temporalio import activity
 
-from poh_delivery.model import CheckResult, CheckSpec, DeployResult
+from poh_delivery.model import CheckResult, CheckSpec, DeployResult, ObservationResult
 
 _log = logging.getLogger(__name__)
 
@@ -189,6 +190,106 @@ class DockerProd:
                     return CheckResult(check.name, False,
                                        f"поле `{key}`: ожидалось {expected!r}, пришло {actual!r}")
         return CheckResult(check.name, True, f"HTTP {response.status_code}")
+
+    # --- наблюдение ---
+
+    def observe(self, duration: int, service: dict) -> ObservationResult:
+        """Наблюдение за контейнером после выкатки.
+
+        Проверяет, что контейнер жив весь период наблюдения, не перезапускается
+        и сохраняет стабильность PID.
+        """
+        if self._dry_run:
+            _log.info("[DRY_RUN] observe %ds", duration)
+            return ObservationResult(duration=duration, alive=True, restarts=0, detail="[DRY_RUN]")
+
+        if duration <= 0:
+            return ObservationResult(duration=0, alive=True, restarts=0, detail="наблюдение отключено (duration=0)")
+
+        # Получаем начальный PID контейнера
+        initial_pid = self._get_container_pid()
+        if initial_pid is None:
+            return ObservationResult(duration=0, alive=False, restarts=0,
+                                   detail="контейнер не найден или не запущен")
+
+        start_time = time.time()
+        end_time = start_time + duration
+        check_interval = 10  # проверять каждые 10 секунд
+
+        last_status = "running"
+        last_restarts = 0
+
+        while time.time() < end_time:
+            time.sleep(check_interval)
+            activity.heartbeat()  # Отправляем heartbeat на каждой итерации
+            
+            # Проверяем статус контейнера
+            status = self._get_container_status()
+            if status != "running":
+                elapsed = int(time.time() - start_time)
+                if status is None:
+                    return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
+                                           detail=f"состояние контейнера неизвестно на секунде {elapsed}")
+                return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
+                                       detail=f"контейнер перешёл в статус '{status}' на секунде {elapsed}")
+            
+            # Проверяем количество перезапусков
+            restarts = self._get_container_restart_count()
+            if restarts is None:
+                _log.warning("не удалось получить restart count через docker inspect")
+                restarts = 0  # fallback, если docker не отдаёт restart count
+            
+            if restarts > last_restarts:
+                elapsed = int(time.time() - start_time)
+                return ObservationResult(duration=elapsed, alive=False, restarts=restarts,
+                                       detail=f"контейнер перезапустился на секунде {elapsed} (всего перезапусков: {restarts})")
+            last_restarts = restarts
+            
+            # Проверяем стабильность PID
+            current_pid = self._get_container_pid()
+            if current_pid is None:
+                elapsed = int(time.time() - start_time)
+                return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
+                                       detail=f"PID контейнера недоступен на секунде {elapsed}")
+            
+            if current_pid != initial_pid:
+                elapsed = int(time.time() - start_time)
+                return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
+                                       detail=f"PID изменился с {initial_pid} на {current_pid} на секунде {elapsed}")
+            
+            last_status = status
+
+        # Успешное прохождение окна
+        final_duration = int(time.time() - start_time)
+        return ObservationResult(duration=final_duration, alive=True, restarts=last_restarts,
+                               detail=f"контейнер прожил {final_duration}с без инцидентов")
+
+    def _get_container_status(self) -> str | None:
+        """Получить статус контейнера через docker inspect."""
+        result = _run(["docker", "inspect", CONTAINER, "--format", "{{.State.Status}}"])
+        if result.returncode != 0:
+            return None
+        return (result.stdout or "").strip()
+
+    def _get_container_restart_count(self) -> int | None:
+        """Получить количество перезапусков контейнера через docker inspect."""
+        result = _run(["docker", "inspect", CONTAINER, "--format", "{{.State.RestartCount}}"])
+        if result.returncode != 0:
+            return None
+        try:
+            return int((result.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def _get_container_pid(self) -> int | None:
+        """Получить PID главного процесса контейнера через docker inspect."""
+        result = _run(["docker", "inspect", CONTAINER, "--format", "{{.State.Pid}}"])
+        if result.returncode != 0:
+            return None
+        try:
+            return int((result.stdout or "").strip())
+        except ValueError:
+            return None
 
 
 def parse_checks(raw: str) -> tuple[dict, list[CheckSpec]]:
