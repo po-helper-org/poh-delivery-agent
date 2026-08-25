@@ -20,6 +20,7 @@ import subprocess
 import time
 
 import requests
+from temporalio import activity
 
 from poh_delivery.model import CheckResult, CheckSpec, DeployResult, ObservationResult
 
@@ -220,11 +221,15 @@ class DockerProd:
 
         while time.time() < end_time:
             time.sleep(check_interval)
+            activity.heartbeat()  # Отправляем heartbeat на каждой итерации
             
             # Проверяем статус контейнера
             status = self._get_container_status()
             if status != "running":
                 elapsed = int(time.time() - start_time)
+                if status is None:
+                    return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
+                                           detail=f"состояние контейнера неизвестно на секунде {elapsed}")
                 return ObservationResult(duration=elapsed, alive=False, restarts=last_restarts,
                                        detail=f"контейнер перешёл в статус '{status}' на секунде {elapsed}")
             

@@ -128,6 +128,12 @@ async def observe(duration: int, service: dict) -> ObservationResult:
                            detail=f"контейнер прожил {duration}с без инцидентов")
 
 
+@activity.defn(name="delivery_get_observe_seconds")
+async def get_observe_seconds() -> int:
+    JOURNAL.append("get_observe_seconds")
+    return STATE.get("observe_seconds", 120)
+
+
 @activity.defn(name="delivery_revert")
 async def revert(repo: str, merge_sha: str, branch: str) -> str:
     JOURNAL.append(f"revert:{merge_sha}")
@@ -180,8 +186,8 @@ async def fix_conflicts(repo: str, number: int) -> str:
 # способ проверить, что слой действительно опционален. Релиз обязан пройти
 # целиком, даже если Harness собран без него.
 ACTIVITIES = [collect_state, read_checks, pull_facts, existing_tags, create_release,
-              update_release, comment, merge, deploy, verify, observe, revert, fix_conflicts,
-              review_round, review_exhausted]
+              update_release, comment, merge, deploy, verify, observe, get_observe_seconds,
+              revert, fix_conflicts, review_round, review_exhausted]
 
 
 async def _run(pulls, **state) -> dict:
@@ -191,17 +197,7 @@ async def _run(pulls, **state) -> dict:
     STATE["facts"] = {p.number: p for p in pulls}
     STATE.update(state)
     
-    # Handle OBSERVE_SECONDS parameter for testing
-    import os
-    original_observe = os.environ.get("DELIVERY_OBSERVE_SECONDS")
-    if "OBSERVE_SECONDS" in state:
-        os.environ["DELIVERY_OBSERVE_SECONDS"] = str(state["OBSERVE_SECONDS"])
-    else:
-        # Ensure default for tests
-        os.environ["DELIVERY_OBSERVE_SECONDS"] = "120"
-    
-    try:
-        async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await WorkflowEnvironment.start_time_skipping() as env:
             client: Client = env.client
             # Активности Harness (`delivery_fix_conflicts`) живут на СВОЕЙ очереди —
             # в тесте поднимаем обе, иначе делегирование конфликта не проверить.
@@ -214,12 +210,6 @@ async def _run(pulls, **state) -> dict:
                     DeliveryRelease.run,
                     DeliveryRequest(repo="o/r", requested_by="kibarik", issue_number=99),
                     id=f"delivery-test-{uuid.uuid4()}", task_queue="delivery")
-    finally:
-        # Restore original environment variable
-        if original_observe is not None:
-            os.environ["DELIVERY_OBSERVE_SECONDS"] = original_observe
-        elif "DELIVERY_OBSERVE_SECONDS" in os.environ:
-            del os.environ["DELIVERY_OBSERVE_SECONDS"]
 
 
 @pytest.mark.asyncio
@@ -232,9 +222,9 @@ async def test_happy_path_ships_in_planned_order():
     merges = [entry for entry in JOURNAL if entry.startswith("merge:")]
     assert merges == ["merge:5", "merge:2"]
     # Ровно тот порядок, что записан в плане: мерж → контракт влитого состояния
-    # → выкатка → окно наблюдения → проверка.
+    # → выкатка → проверка → окно наблюдения → повторная проверка.
     window = JOURNAL[JOURNAL.index("merge:5"):]
-    assert window[:5] == ["merge:5", "checks:merged5", "deploy:merged5", "observe", "verify"]
+    assert window[:7] == ["merge:5", "checks:merged5", "deploy:merged5", "verify", "get_observe_seconds", "observe", "verify"]
     assert "publish:True" in JOURNAL
 
 
@@ -408,8 +398,12 @@ async def test_checks_are_reread_from_the_merged_state():
     assert JOURNAL.index("checks:main") < JOURNAL.index("merge:1")
     assert JOURNAL.index("merge:1") < JOURNAL.index("checks:merged1")
     assert JOURNAL.index("checks:merged1") < JOURNAL.index("deploy:merged1")
-    assert JOURNAL.index("deploy:merged1") < JOURNAL.index("observe")
-    assert JOURNAL.index("observe") < JOURNAL.index("verify")
+    # Порядок: deploy → verify → observe → verify
+    assert JOURNAL.index("deploy:merged1") < JOURNAL.index("verify")
+    assert JOURNAL.index("verify") < JOURNAL.index("observe")
+    # Второй verify должен быть после observe
+    first_verify_idx = JOURNAL.index("verify")
+    assert JOURNAL.index("observe") < [i for i, x in enumerate(JOURNAL) if x == "verify" and i > first_verify_idx][0]
 
 
 @pytest.mark.asyncio
@@ -422,30 +416,30 @@ async def test_observation_failure_rolls_back_and_stops_queue():
     assert "revert:merged1" in JOURNAL
     # Второй PR не трогается вовсе — очередь остановлена.
     assert "merge:2" not in JOURNAL
-    # Проверки после провала окна не запускаются.
+    # Проверки после провала окна не запускаются (только первый verify до observe)
     assert JOURNAL.index("observe") < JOURNAL.index("revert:merged1")
-    assert "verify" not in JOURNAL
+    # Должен быть только один verify (до observe), а не два
+    assert JOURNAL.count("verify") == 1
 
 
 @pytest.mark.asyncio
 async def test_zero_duration_skips_observation():
     """Нулевая длительность окна должна пропускать наблюдение."""
-    result = await _run([_pr(1)], OBSERVE_SECONDS=0)
+    result = await _run([_pr(1)], observe_seconds=0)
 
     assert result["shipped"] == [1]
     assert "observe" not in JOURNAL
-    # Порядок должен быть как раньше: deploy → verify
-    window = [entry for entry in JOURNAL if entry in ("deploy:merged1", "observe", "verify")]
-    assert window == ["deploy:merged1", "verify"]
+    # Порядок должен быть: deploy → verify → get_observe_seconds → (нет observe) → verify
+    window = [entry for entry in JOURNAL if entry in ("deploy:merged1", "observe", "verify", "get_observe_seconds")]
+    assert window == ["deploy:merged1", "verify", "get_observe_seconds", "verify"]
 
 
 @pytest.mark.asyncio
 async def test_observation_between_deploy_and_verify():
-    """Окно наблюдения должно быть строго между deploy и verify."""
+    """Окно наблюдения должно быть между двумя прогонами проверок."""
     result = await _run([_pr(1)])
 
     assert result["shipped"] == [1]
-    deploy_idx = JOURNAL.index("deploy:merged1")
-    observe_idx = JOURNAL.index("observe")
-    verify_idx = JOURNAL.index("verify")
-    assert deploy_idx < observe_idx < verify_idx
+    # Порядок: deploy → verify → get_observe_seconds → observe → verify
+    window = [entry for entry in JOURNAL if entry in ("deploy:merged1", "observe", "verify", "get_observe_seconds")]
+    assert window == ["deploy:merged1", "verify", "get_observe_seconds", "observe", "verify"]

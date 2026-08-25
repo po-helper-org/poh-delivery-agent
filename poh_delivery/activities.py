@@ -10,6 +10,7 @@ Temporal и есть журнал релиза, и «влил PR» обязан�
 """
 
 import logging
+import os
 
 from temporalio import activity
 
@@ -28,6 +29,8 @@ from poh_delivery.model import (
 _log = logging.getLogger(__name__)
 
 CHECKS_PATH = ".delivery/checks.json"
+OBSERVE_SECONDS_DEFAULT = 120
+OBSERVE_SECONDS_MAX = 900
 
 
 @activity.defn(name="delivery_collect_state")
@@ -114,6 +117,22 @@ def observe(duration: int, service: dict) -> ObservationResult:
     return ports.prod().observe(duration, service)
 
 
+@activity.defn(name="delivery_get_observe_seconds")
+def get_observe_seconds() -> int:
+    """Читает длительность окна наблюдения из переменной окружения с защитой.
+
+    Активность, а не чтение в воркфлоу: воркфлоу обязан быть детерминированным,
+    и чтение окружения нарушает воспроизведение истории при реплее.
+    """
+    try:
+        raw = os.environ.get("DELIVERY_OBSERVE_SECONDS", str(OBSERVE_SECONDS_DEFAULT))
+        value = int(raw)
+    except ValueError:
+        _log.warning("DELIVERY_OBSERVE_SECONDS не является числом: %r, используется значение по умолчанию %s", raw, OBSERVE_SECONDS_DEFAULT)
+        return OBSERVE_SECONDS_DEFAULT
+    return max(0, min(OBSERVE_SECONDS_MAX, value))
+
+
 @activity.defn(name="delivery_revert")
 def revert(repo: str, merge_sha: str, branch: str) -> str:
     return ports.github().revert_merge(repo, merge_sha, branch)
@@ -162,6 +181,7 @@ ALL = [
     deploy,
     verify,
     observe,
+    get_observe_seconds,
     revert,
     prod_sha,
     memory_rules,
