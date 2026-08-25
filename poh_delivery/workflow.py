@@ -256,7 +256,7 @@ class DeliveryRelease:
 
             # Повторный прогон проверок после окна наблюдения
             final_checks = []
-            if deployed.ok and (observation is None or observation.alive):
+            if deployed.ok and not [c for c in checks if not c.ok] and (observation is None or observation.alive):
                 if bundle.checks:
                     final_checks = await workflow.execute_activity(
                         "delivery_verify", args=[bundle.checks, bundle.service],
