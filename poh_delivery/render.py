@@ -9,7 +9,7 @@
 
 import re
 
-from poh_delivery.model import CheckSpec, ReleasePlan, StepOutcome, Verdict
+from poh_delivery.model import CheckSpec, ObservationResult, ReleasePlan, StepOutcome, Verdict
 
 _CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
 
@@ -95,8 +95,9 @@ def plan_md(plan: ReleasePlan, requested_by: str, run_id: str, workflow_id: str,
                "относится ли вердикт ревью к текущему коммиту.")
     out.append("2. Мерж в базовую ветку.")
     out.append("3. Выкатка получившегося состояния базы на прод-контур.")
-    out.append("4. Прогон проверок из списка выше по живому сервису.")
-    out.append("5. Провал любой проверки — откат: возврат прошлой сборки и `git revert` мержа.")
+    out.append("4. Окно наблюдения — сервис должен прожить заданный период без падения и перезапусков.")
+    out.append("5. Прогон проверок из списка выше по живому сервису.")
+    out.append("6. Провал проверки или окна наблюдения — откат: возврат прошлой сборки и `git revert` мержа.")
     out.append("   Остаток очереди не отгружается.")
     out.append("")
 
@@ -143,6 +144,22 @@ def _outcome_line(outcome: StepOutcome) -> str:
     return f"⚠️ #{outcome.pr_number} — не отгружен: {outcome.detail}"
 
 
+def _observation_block(observation: ObservationResult) -> str:
+    """Форматирование блока наблюдения для отчёта."""
+    if observation is None:
+        return ""
+    
+    status = "✅ прожил" if observation.alive else "❌ не пережил"
+    lines = [
+        f"**Наблюдение после выкатки:** {status}",
+        f"- Длительность окна: {observation.duration}с",
+        f"- Перезапусков: {observation.restarts}",
+    ]
+    if observation.detail:
+        lines.append(f"- Деталь: {observation.detail}")
+    return "\n".join(lines) + "\n"
+
+
 def report_md(plan: ReleasePlan, outcomes: list[StepOutcome], bodies: dict[int, str],
               run_id: str, workflow_id: str, finished_at: str) -> str:
     """Тело релиза после выкатки: что сделано, что изменилось для пользователей."""
@@ -184,6 +201,16 @@ def report_md(plan: ReleasePlan, outcomes: list[StepOutcome], bodies: dict[int, 
             for check in outcome.checks:
                 mark = "зелёная" if check.ok else f"**красная** — {check.detail}"
                 out.append(f"| #{outcome.pr_number} | `{check.name}` | {mark} |")
+        out.append("")
+
+    # Добавляем раздел наблюдения для шагов, где есть данные
+    observed_outcomes = [o for o in outcomes if o.observation is not None]
+    if observed_outcomes:
+        out.append("### Наблюдение после выкатки")
+        out.append("")
+        for outcome in observed_outcomes:
+            out.append(f"**PR #{outcome.pr_number}:**")
+            out.append(_observation_block(outcome.observation))
         out.append("")
 
     if failed:

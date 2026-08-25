@@ -10,7 +10,7 @@
 
 from typing import Protocol
 
-from poh_delivery.model import CheckResult, CheckSpec, DeployResult, PullFacts
+from poh_delivery.model import CheckResult, CheckSpec, DeployResult, ObservationResult, PullFacts
 
 
 class GitHubPort(Protocol):
@@ -35,6 +35,7 @@ class ProdPort(Protocol):
     def deploy(self, repo: str, sha: str, service: dict) -> DeployResult: ...
     def verify(self, checks: list[CheckSpec], service: dict) -> list[CheckResult]: ...
     def current_sha(self) -> str: ...
+    def observe(self, duration: int, service: dict) -> ObservationResult: ...
 
 
 _github: GitHubPort | None = None

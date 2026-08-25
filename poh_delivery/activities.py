@@ -19,6 +19,7 @@ from poh_delivery.model import (
     CheckSpec,
     ChecksBundle,
     DeployResult,
+    ObservationResult,
     PullFacts,
     ReleaseRef,
     RepoState,
@@ -103,6 +104,16 @@ def verify(checks: list[CheckSpec], service: dict) -> list[CheckResult]:
     return ports.prod().verify(checks, service)
 
 
+@activity.defn(name="delivery_observe")
+def observe(duration: int, service: dict) -> ObservationResult:
+    """Наблюдение за контейнером после выкатки.
+
+    Проверяет, что контейнер жив весь период наблюдения, не перезапускается
+    и сохраняет стабильность PID.
+    """
+    return ports.prod().observe(duration, service)
+
+
 @activity.defn(name="delivery_revert")
 def revert(repo: str, merge_sha: str, branch: str) -> str:
     return ports.github().revert_merge(repo, merge_sha, branch)
@@ -150,6 +161,7 @@ ALL = [
     merge,
     deploy,
     verify,
+    observe,
     revert,
     prod_sha,
     memory_rules,
